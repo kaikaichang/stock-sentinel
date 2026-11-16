@@ -22,7 +22,10 @@ stock-sentinel/
 ├─ requirements.txt
 ├─ .env              # 不進版控
 ├─ .venv/            # 不進版控
-└─ data/             # SQLite 檔案存放處，不進版控
+├─ data/             # SQLite 檔案存放處，不進版控
+├─ charts/           # chart.py 產生的互動 HTML，不進版控
+├─ sync.py / screen.py / chart.py
+└─ sentinel/         # db、models、repository、indicators、fetcher
 ```
 
 ## 常用指令（Windows PowerShell）
