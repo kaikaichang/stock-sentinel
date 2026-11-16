@@ -23,6 +23,10 @@ class Watchlist(Base):
     target_high: Mapped[float | None] = mapped_column(Float)  # 高價警示
     notes: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 'core'＝使用者手動關注的核心自選；'sp500'＝批次匯入的成分股掃描池。
+    # 分開存放是為了讓預設同步、警示價只作用在核心自選，不會被 500 檔拖慢或誤觸限流。
+    category: Mapped[str] = mapped_column(String(10), default="core",
+                                          server_default="core", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

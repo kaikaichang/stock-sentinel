@@ -19,21 +19,25 @@ st.set_page_config(page_title="Stock Sentinel", page_icon="📈", layout="wide")
 init_db()
 
 
-def load_markers() -> tuple[set[str], set[str]]:
+POOLS = {"核心自選": "core", "S&P 500 掃描池": "sp500"}
+
+
+def load_markers(category: str) -> tuple[set[str], set[str]]:
     """回傳 (月 KD 低檔黃金交叉的代號集合, 觸及警示價的代號集合)。判斷規則與 screen.py 完全相同。"""
     with SessionLocal() as s:
-        gc = {m.symbol for m, _ in repo.golden_cross_candidates(s)}
+        gc = {m.symbol for m, _ in repo.golden_cross_candidates(s, category)}
         alerts = {w.symbol for w, *_ in repo.price_alerts(s)}
     return gc, alerts
 
 
-def load_watchlist() -> dict[str, str]:
-    """{代號: 名稱}，只含啟用中的標的。"""
+def load_watchlist(category: str) -> dict[str, str]:
+    """{代號: 名稱}，只含啟用中且屬於該標的池的標的。"""
     from sentinel.models import Watchlist
     from sqlalchemy import select
     with SessionLocal() as s:
         rows = s.execute(select(Watchlist.symbol, Watchlist.name)
-                         .where(Watchlist.is_active).order_by(Watchlist.symbol)).all()
+                         .where(Watchlist.is_active, Watchlist.category == category)
+                         .order_by(Watchlist.symbol)).all()
     return {sym: (name or "") for sym, name in rows}
 
 
@@ -93,15 +97,12 @@ def build_chart(m: pd.DataFrame, symbol: str) -> go.Figure:
 
 
 # ───────────────────────── 側邊欄 ─────────────────────────
-watch = load_watchlist()
-gc_set, alert_set = load_markers()
-with SessionLocal() as _s:
-    fmap = repo.fundamentals_map(_s)
-
-# 新增股票成功後要自動切換選取；selectbox 建立後不能再改它的 state，
-# 所以先把目標存在 pending_select，下一輪重跑、selectbox 建立「之前」再套用。
+# 新增股票成功後要自動切換選取；widget 建立後不能再改它的 state，
+# 所以先把目標存在 pending_select，下一輪重跑、widget 建立「之前」再套用。
+# 新增的標的一律是核心自選，因此連標的池也要一併切回 core，否則使用者會看不到剛新增的股票。
 if "pending_select" in st.session_state:
-    st.session_state["symbol"] = st.session_state.pop("pending_select")
+    st.session_state["pool"] = "核心自選"
+    st.session_state["symbol_core"] = st.session_state.pop("pending_select")
 
 
 def fmt_pct(v: float | None) -> str:
@@ -119,29 +120,51 @@ def label(sym: str) -> str:
 
 with st.sidebar:
     st.header("📈 Stock Sentinel")
-    st.subheader("基本面過濾")
-    f_pe = st.checkbox("只看 PE < 15")
-    f_roe = st.checkbox("只看 ROE > 15%")
-    f_dy = st.checkbox("只看殖利率 > 4%")
-    # 三個條件為 AND；沒資料（None）的標的在條件啟用時一律排除，避免把「沒資料」當成「便宜」
-    passed = repo.filter_by_fundamentals(
-        fmap, max_pe=15 if f_pe else None,
-        min_roe=0.15 if f_roe else None, min_yield=0.04 if f_dy else None)
-    options = [s for s in watch if passed is None or s in passed]
+    pool_label = st.radio("標的池", list(POOLS), key="pool", horizontal=True)
+    category = POOLS[pool_label]
+    is_scan = category == "sp500"
 
-    st.subheader("已收錄標的")
+    # 標的池一變，名單與標記就跟著變，所以必須在 radio 之後才載入
+    watch = load_watchlist(category)
+    gc_set, alert_set = load_markers(category)
+    with SessionLocal() as _s:
+        fmap = repo.fundamentals_map(_s)
+
+    passed = None
+    only_gc = False
+    if is_scan:
+        # 500 檔的下拉選單無法瀏覽，預設只列黃金交叉候選，這才是掃描池的用途
+        only_gc = st.checkbox("只列月 KD 黃金交叉", value=True)
+        st.caption("掃描池為批次同步，只有價量與月 KD，沒有新聞與基本面。")
+    else:
+        st.subheader("基本面過濾")
+        f_pe = st.checkbox("只看 PE < 15")
+        f_roe = st.checkbox("只看 ROE > 15%")
+        f_dy = st.checkbox("只看殖利率 > 4%")
+        # 三個條件為 AND；沒資料（None）的標的在條件啟用時一律排除，避免把「沒資料」當成「便宜」
+        passed = repo.filter_by_fundamentals(
+            fmap, max_pe=15 if f_pe else None,
+            min_roe=0.15 if f_roe else None, min_yield=0.04 if f_dy else None)
+    options = [s for s in watch
+               if (passed is None or s in passed) and (not only_gc or s in gc_set)]
+
+    st.subheader("已收錄標的" if not is_scan else f"掃描結果（{len(options)} 檔）")
+    sel_key = f"symbol_{category}"  # 兩個池各自記住選取，切換回來不會被重置
     if options:
         # 過濾後原本選的標的可能不在清單內；selectbox 的 state 必須是合法選項，先重置避免例外
-        if st.session_state.get("symbol") not in options:
-            st.session_state.pop("symbol", None)
-        symbol = st.selectbox("選擇股票", options, key="symbol", format_func=label)
+        if st.session_state.get(sel_key) not in options:
+            st.session_state.pop(sel_key, None)
+        symbol = st.selectbox("選擇股票", options, key=sel_key, format_func=label)
         st.caption("🟢 月KD<20 黃金交叉　🔔 觸及警示價")
     else:
         symbol = None
-        if watch:
-            st.warning("沒有標的符合目前的基本面條件，請取消部分勾選。")
+        if not watch:
+            st.info("掃描池是空的，請先執行 `python sync.py --import-sp500`。" if is_scan
+                    else "資料庫還沒有標的，請先在下方新增。")
+        elif is_scan:
+            st.warning("目前沒有月 KD 黃金交叉的標的，可取消勾選瀏覽全部。")
         else:
-            st.info("資料庫還沒有標的，請先在下方新增。")
+            st.warning("沒有標的符合目前的基本面條件，請取消部分勾選。")
 
     st.divider()
     st.subheader("新增股票")
@@ -171,7 +194,7 @@ st.title(f"{symbol}　{watch.get(symbol, '')}")
 
 if monthly.empty or last_px is None:
     st.warning("這檔還沒有價格資料，請先用 `python sync.py --symbol "
-               f"{symbol}` 同步，或在側邊欄重新抓取。")
+               f"{symbol}` 同步（S&P 500 池可用 `python sync.py --batch-sp500`）。")
 else:
     cur = monthly.iloc[-1]
     c1, c2, c3 = st.columns(3)

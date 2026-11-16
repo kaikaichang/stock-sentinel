@@ -2,6 +2,7 @@
 
 用法：
     python screen.py                                   # 與以往相同
+    python screen.py --pool sp500                      # 掃 S&P 500 池的月 KD 黃金交叉
     python screen.py --max-pe 15 --min-roe 15 --min-yield 4
         # 有給基本面條件時：黃金交叉候選會再 AND 過濾，並另列「基本面篩選」區塊
 """
@@ -27,6 +28,8 @@ def _fund_text(f) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="stock-sentinel 篩選工具")
+    p.add_argument("--pool", choices=["core", "sp500", "all"], default="core",
+                   help="掃描範圍：core 核心自選（預設）、sp500 成分股池、all 全部")
     p.add_argument("--max-pe", type=float, help="PE 小於此值")
     p.add_argument("--max-pb", type=float, help="PB 小於此值")
     p.add_argument("--min-roe", type=float, help="ROE 大於此值（百分比，例如 15）")
@@ -36,14 +39,16 @@ def main() -> None:
     roe = None if args.min_roe is None else args.min_roe / 100
     dy = None if args.min_yield is None else args.min_yield / 100
 
+    # 預設 core：保持與加入 S&P 500 池之前完全相同的輸出，不會一次噴出數十檔
+    category = None if args.pool == "all" else args.pool
     init_db()
     with SessionLocal() as s:
-        cands = repo.golden_cross_candidates(s)
+        cands = repo.golden_cross_candidates(s, category)
         alerts = repo.price_alerts(s)
         fmap = repo.fundamentals_map(s)
         passed = repo.filter_by_fundamentals(
             fmap, max_pe=args.max_pe, max_pb=args.max_pb, min_roe=roe, min_yield=dy)
-        active = set(repo.active_symbols(s))
+        active = set(repo.active_symbols(s, category))
 
     filtering = passed is not None
     if filtering:
@@ -51,22 +56,28 @@ def main() -> None:
         cands = [(m, n) for m, n in cands if m.symbol in passed]
 
     title = "（並符合基本面條件）" if filtering else ""
-    print(f"=== 月 KD 低檔黃金交叉（K<20、D<20、prev_K<=prev_D 且 K>D）{title}===")
+    pool_name = {"core": "", "sp500": "【S&P 500 池】", "all": "【全部】"}[args.pool]
+    print(f"=== {pool_name}月 KD 低檔黃金交叉（K<20、D<20、prev_K<=prev_D 且 K>D）{title}===")
+    if filtering and args.pool != "core":
+        print("（提醒：S&P 500 池為批次同步，沒有基本面資料，基本面條件啟用時會被排除）")
     if not cands:
         print("（無符合標的）")
+    if cands:
+        print(f"（共 {len(cands)} 檔）")
     for m, name in cands:
         flag = "（當月未收盤）" if m.is_partial else ""
         extra = f"  {_fund_text(fmap.get(m.symbol))}" if filtering else ""
-        print(f"{m.symbol:<9}{name or '':<14}{m.year_month}  "
+        print(f"{m.symbol:<9}{(name or '')[:18]:<19}{m.year_month}  "
               f"K {m.prev_k:.1f}→{m.k_val:.1f}  D {m.prev_d:.1f}→{m.d_val:.1f}  "
               f"收盤 {m.close:.2f} {flag}{extra}")
 
-    print("\n=== 警示價觸發 ===")
-    if not alerts:
-        print("（無觸發）")
-    for w, d, close, kind in alerts:
-        label = f"跌破低價 {w.target_low}" if kind == "LOW" else f"突破高價 {w.target_high}"
-        print(f"{w.symbol:<9}{w.name or '':<14}{d}  收盤 {close:.2f}  {label}")
+    if args.pool != "sp500":  # S&P 500 池沒有設警示價，不需列出
+        print("\n=== 警示價觸發 ===")
+        if not alerts:
+            print("（無觸發）")
+        for w, d, close, kind in alerts:
+            label = f"跌破低價 {w.target_low}" if kind == "LOW" else f"突破高價 {w.target_high}"
+            print(f"{w.symbol:<9}{w.name or '':<14}{d}  收盤 {close:.2f}  {label}")
 
     if filtering:
         # 不限黃金交叉，單純列出基本面達標的自選股

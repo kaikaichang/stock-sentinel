@@ -1,7 +1,7 @@
 """資料庫引擎與連線設定。"""
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
@@ -40,3 +40,22 @@ def init_db() -> None:
     from .models import Base
 
     Base.metadata.create_all(engine)
+    _ensure_columns()
+
+
+def _ensure_columns() -> None:
+    """替既有資料庫補上後來新增的欄位（目前：watchlist.category）。
+
+    為什麼需要：create_all 只會建立「不存在的資料表」，不會替已存在的表加欄位。
+    既有的 stocks.db 是舊結構，若不補欄位，查詢 category 會直接報 no such column。
+    ADD COLUMN 帶 DEFAULT 'core'：SQLite 要求 NOT NULL 的新欄位必須有預設值，
+    同時讓既有的核心自選股自動歸為 core，不用另外搬資料。
+    冪等：先用 PRAGMA table_info 檢查，已有欄位就略過，重複啟動是安全的。
+    """
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(watchlist)"))}
+        if "category" not in cols:
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN category VARCHAR(10) NOT NULL DEFAULT 'core'"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_watchlist_category ON watchlist (category)"))

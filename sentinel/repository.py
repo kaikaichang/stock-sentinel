@@ -20,18 +20,48 @@ def add_watch(session: Session, symbol: str, name=None, market=None,
     stmt = insert(Watchlist).values(
         symbol=symbol.upper(), name=name, market=market,
         target_low=target_low, target_high=target_high, notes=notes, is_active=True,
+        category="core",
     )
     # 重複新增時只更新「使用者有明確給的欄位」，避免覆蓋掉先前設定的警示價
     update = {k: v for k, v in dict(name=name, target_low=target_low,
                                     target_high=target_high, notes=notes).items()
               if v is not None}
     update["is_active"] = True
+    # 使用者手動新增＝明確表示要關注，所以連 S&P 500 池裡的標的也升級為 core
+    # （反過來，批次匯入絕不會把 core 降級，見 import_universe）。
+    update["category"] = "core"
     session.execute(stmt.on_conflict_do_update(index_elements=["symbol"], set_=update))
 
 
-def active_symbols(session: Session) -> list[str]:
-    return list(session.scalars(
-        select(Watchlist.symbol).where(Watchlist.is_active).order_by(Watchlist.symbol)))
+def active_symbols(session: Session, category: str | None = "core") -> list[str]:
+    """啟用中的代號。預設只回 core：匯入 S&P 500 後，
+    無參數的 `python sync.py` 才不會變成逐檔同步 500 檔（含新聞）而被限流。傳 None 取全部。"""
+    q = select(Watchlist.symbol).where(Watchlist.is_active)
+    if category is not None:
+        q = q.where(Watchlist.category == category)
+    return list(session.scalars(q.order_by(Watchlist.symbol)))
+
+
+def import_universe(session: Session, items: list[tuple[str, str]],
+                    category: str = "sp500") -> tuple[int, int]:
+    """批次匯入標的池，回傳 (新增檔數, 既有略過檔數)。
+
+    衝突時刻意「不碰 category、警示價、is_active」：若 NVDA 已在核心自選，
+    匯入 S&P 500 不能把它降級成 sp500，否則它會從預設同步與警示檢查中消失。
+    只在既有名稱為空時補上名稱。
+    """
+    if not items:
+        return 0, 0
+    existing = set(session.scalars(select(Watchlist.symbol)))
+    rows = [dict(symbol=sym, name=name, market="TW" if sym.endswith((".TW", ".TWO")) else "US",
+                 is_active=True, category=category) for sym, name in items]
+    stmt = insert(Watchlist)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["symbol"],
+        set_={"name": func.coalesce(Watchlist.name, stmt.excluded.name)})
+    session.execute(stmt, rows)
+    added = sum(1 for sym, _ in items if sym not in existing)
+    return added, len(items) - added
 
 
 def latest_trade_date(session: Session, symbol: str) -> date | None:
@@ -109,8 +139,8 @@ def recompute_monthly(session: Session, symbol: str) -> int:
     return len(rows)
 
 
-def golden_cross_candidates(session: Session) -> list[tuple]:
-    """每檔最新一期月線：K<20 且 D<20，且發生黃金交叉。"""
+def golden_cross_candidates(session: Session, category: str | None = None) -> list[tuple]:
+    """每檔最新一期月線：K<20 且 D<20，且發生黃金交叉。category 為 None 表示不分池。"""
     latest = (select(MonthlyIndicator.symbol,
                      func.max(MonthlyIndicator.year_month).label("ym"))
               .group_by(MonthlyIndicator.symbol).subquery())
@@ -123,13 +153,17 @@ def golden_cross_candidates(session: Session) -> list[tuple]:
                 MonthlyIndicator.prev_k <= MonthlyIndicator.prev_d,
                 MonthlyIndicator.k_val > MonthlyIndicator.d_val)
          .order_by(MonthlyIndicator.symbol))
+    if category is not None:
+        q = q.where(Watchlist.category == category)
     return list(session.execute(q).all())
 
 
 def price_alerts(session: Session) -> list[tuple]:
-    """回傳 (Watchlist, 最新交易日, 最新收盤, 'LOW'|'HIGH')。以最新收盤判斷。"""
+    """回傳 (Watchlist, 最新交易日, 最新收盤, 'LOW'|'HIGH')。以最新收盤判斷。
+    只看有設警示價的標的：S&P 500 池沒有警示價，先過濾掉可避免對 500 檔各查一次最新收盤。"""
     out = []
-    for w in session.scalars(select(Watchlist).where(Watchlist.is_active)):
+    has_target = Watchlist.target_low.is_not(None) | Watchlist.target_high.is_not(None)
+    for w in session.scalars(select(Watchlist).where(Watchlist.is_active, has_target)):
         last = session.execute(
             select(DailyPrice.trade_date, DailyPrice.close)
             .where(DailyPrice.symbol == w.symbol, DailyPrice.close.is_not(None))

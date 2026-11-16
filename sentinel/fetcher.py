@@ -94,3 +94,55 @@ def fetch_fundamentals(symbol: str) -> dict:
         free_cashflow=_num(info.get("freeCashflow")),
         debt_to_equity=_num(info.get("debtToEquity")),
     )
+
+
+# ---- S&P 500 成分股池 ----
+
+SP500_CSV_URL = ("https://raw.githubusercontent.com/datasets/"
+                 "s-and-p-500-companies/main/data/constituents.csv")
+
+
+def fetch_sp500_list() -> list[tuple[str, str]]:
+    """抓 S&P 500 成分股 [(代號, 名稱)]。
+
+    代號的 "." 要換成 "-"（BRK.B → BRK-B）：Yahoo 用連字號表示股別，
+    不轉的話 yfinance 會查無資料而被當成下市股。
+    選 GitHub 上的 CSV 而非 Wikipedia：純 CSV 不需 HTML 解析套件與偽裝 User-Agent，較穩。
+    """
+    df = pd.read_csv(SP500_CSV_URL)
+    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+    return list(dict.fromkeys(zip(df["Symbol"], df["Security"].astype(str))))
+
+
+def fetch_daily_batch(symbols: list[str], start: date | None = None,
+                      period: str = "2y") -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """用 yf.download 一次打包多檔日線，回傳 ({代號: 日線表}, 抓不到的代號)。
+
+    為什麼打包：逐檔呼叫每檔都是一次獨立 HTTP 往返，500 檔太慢；
+    download 內部多執行緒並行，50 檔一批的總時間遠小於逐檔相加。
+    欄位與 fetch_daily 完全一致，讓同一套 upsert_daily / recompute_monthly 可直接使用。
+    只給 start 時（增量重跑）改用起始日，period 才是首次的 2 年。
+    """
+    kwargs = {"start": start.isoformat()} if start else {"period": period}
+    # auto_adjust=False：與 fetch_daily 相同，保留原始價（KD 用）與 Adj Close
+    raw = yf.download(symbols, group_by="ticker", auto_adjust=False,
+                      threads=True, progress=False, **kwargs)
+    out: dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return out, list(symbols)
+    for sym in symbols:
+        try:
+            # 多檔時第一層是代號；只有單檔且欄位不是 MultiIndex 時直接用整張表
+            df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+        except KeyError:
+            continue
+        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
+                                "Close": "close", "Adj Close": "adj_close",
+                                "Volume": "volume"})
+        # 下市或代號錯誤的標的整欄都是 NaN；某檔在其他檔有交易日卻沒資料時也會出現全 NaN 列
+        df = df[["open", "high", "low", "close", "adj_close", "volume"]].dropna(subset=["close"])
+        if df.empty:
+            continue
+        df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+        out[sym] = df
+    return out, [s for s in symbols if s not in out]
