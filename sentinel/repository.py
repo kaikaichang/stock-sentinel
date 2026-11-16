@@ -257,3 +257,87 @@ def filter_by_fundamentals(fmap: dict[str, Fundamentals], *, max_pe: float | Non
     if not checks:
         return None
     return {sym for sym, f in fmap.items() if all(c(f) for c in checks)}
+
+
+# ---- 月 KD 多條件回溯搜尋 ----
+
+SIGNAL_TYPES = ("golden_cross", "hook_up", "death_cross")
+DEATH_CROSS_HIGH = 80  # 高檔死亡交叉的門檻固定 80；kd_threshold 只管低檔訊號
+
+
+def _signal_month_floor(max_stale_months: int, today: date | None = None) -> str:
+    """最新月線至少要是這個 'YYYY-MM' 才算「資料還新」。"""
+    today = today or date.today()
+    idx = today.year * 12 + (today.month - 1) - max_stale_months
+    return f"{idx // 12:04d}-{idx % 12 + 1:02d}"
+
+
+def screen_monthly_kd(session: Session, signal_type: str, lookback_months: int = 3,
+                      kd_threshold: float = 20, still_bullish: bool = True,
+                      category: str | None = None,
+                      max_stale_months: int = 1) -> pd.DataFrame:
+    """回溯「最新 N 根月線」內曾發生指定訊號的標的，每檔只回最近一次訊號。
+
+    signal_type：
+      golden_cross  低檔黃金交叉：前期 K<=D、本期 K>D，且 K、D 都 < kd_threshold
+      hook_up       低檔勾頭向上：尚未交叉（K<=D），K < kd_threshold 且 K 比前期高
+      death_cross   高檔死亡交叉：前期 K>=D、本期 K<D，且 K、D 都 > 80
+
+    為什麼用 ROW_NUMBER 排名、而不是用日曆月份相減：
+    窗口要的是「最新 N 根月線」。停牌、剛上市或缺月的標的若用日曆月份，窗口會錯位；
+    排名則永遠以該檔自己的最新一根為第 1 根，N=1 就等同於「只看最新一期」。
+
+    為什麼用兩層視窗函數：
+    第一層 rn 幫每檔的月線由新到舊編號（rn=1 為最新一根，也拿來取「最新 K/D/收盤」）；
+    第二層 sr 只在「符合訊號」的月線中再編號，取 sr=1 就是最近一次訊號，
+    不必在 Python 端逐檔迴圈，500 檔也是一條 SQL。
+
+    注意：訊號月若是尚未走完的當月（is_partial），K/D 會隨每日資料變動，
+    月初出現的訊號到月底可能消失，所以結果帶出 is_partial 讓介面標示。
+    max_stale_months：最新月線太舊（久未同步或已下市）的標的不列入，避免把舊訊號當現況。
+    """
+    if signal_type not in SIGNAL_TYPES:
+        raise ValueError(f"signal_type 必須是 {SIGNAL_TYPES} 之一")
+    if lookback_months < 1:
+        raise ValueError("lookback_months 至少為 1")
+
+    M = MonthlyIndicator
+    rn = func.row_number().over(partition_by=M.symbol, order_by=M.year_month.desc()).label("rn")
+    base = (select(M.symbol, M.year_month, M.k_val, M.d_val, M.prev_k, M.prev_d,
+                   M.close, M.is_partial, Watchlist.name, rn)
+            .join(Watchlist, Watchlist.symbol == M.symbol)
+            .where(Watchlist.is_active))
+    if category is not None:
+        base = base.where(Watchlist.category == category)
+    ranked = base.subquery("ranked")
+    c = ranked.c
+
+    # prev_k / prev_d 為 NULL（第一根月線）時比較結果為 NULL，會自然被排除，不需額外判斷
+    if signal_type == "golden_cross":
+        cond = ((c.prev_k <= c.prev_d) & (c.k_val > c.d_val)
+                & (c.k_val < kd_threshold) & (c.d_val < kd_threshold))
+    elif signal_type == "hook_up":
+        cond = ((c.k_val <= c.d_val) & (c.k_val < kd_threshold) & (c.k_val > c.prev_k))
+    else:  # death_cross
+        cond = ((c.prev_k >= c.prev_d) & (c.k_val < c.d_val)
+                & (c.k_val > DEATH_CROSS_HIGH) & (c.d_val > DEATH_CROSS_HIGH))
+
+    sr = func.row_number().over(partition_by=c.symbol, order_by=c.rn).label("sr")
+    sig = (select(c.symbol, c.name, c.year_month.label("signal_month"),
+                  c.k_val.label("sig_k"), c.d_val.label("sig_d"), sr)
+           .where(c.rn <= lookback_months, cond)).subquery("sig")
+    latest = (select(c.symbol, c.year_month, c.k_val, c.d_val, c.close, c.is_partial)
+              .where(c.rn == 1)).subquery("latest")
+
+    q = (select(sig.c.symbol, sig.c.name, sig.c.signal_month, sig.c.sig_k, sig.c.sig_d,
+                latest.c.k_val, latest.c.d_val, latest.c.close, latest.c.is_partial,
+                latest.c.year_month.label("latest_month"))
+         .join(latest, latest.c.symbol == sig.c.symbol)
+         .where(sig.c.sr == 1, latest.c.year_month >= _signal_month_floor(max_stale_months)))
+    if still_bullish and signal_type == "golden_cross":
+        q = q.where(latest.c.k_val > latest.c.d_val)  # 最新一期仍維持 K > D（交叉後沒有又掉回去）
+    q = q.order_by(sig.c.signal_month.desc(), sig.c.sig_k.asc())
+
+    return pd.DataFrame(session.execute(q).all(), columns=[
+        "symbol", "name", "signal_month", "sig_k", "sig_d",
+        "k_val", "d_val", "close", "is_partial", "latest_month"])
