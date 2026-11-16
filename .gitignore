@@ -1,0 +1,21 @@
+# 機密設定
+.env
+
+# Python 虛擬環境與快取
+.venv/
+__pycache__/
+*.py[cod]
+
+# SQLite 資料庫檔（含 WAL 模式產生的輔助檔）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/**/*.db
+data/**/*.db-wal
+data/**/*.db-shm
+
+# 編輯器 / 系統檔
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
