@@ -21,11 +21,15 @@ def sync_one(symbol: str) -> None:
         last = repo.latest_trade_date(s, symbol)
     df = fetcher.fetch_daily(symbol, last)
     news = fetcher.fetch_news(symbol)
+    # 基本面只是輔助資料：fetch_fundamentals 內部已容錯，失敗時各欄為 None，不會中斷日線同步
+    fund = fetcher.fetch_fundamentals(symbol)
     with SessionLocal.begin() as s:
         n_px = repo.upsert_daily(s, symbol, df)
         n_news = repo.upsert_news(s, symbol, news)
         n_m = repo.recompute_monthly(s, symbol)
-    print(f"  日線 {n_px} 筆、新聞 {n_news} 則、月線 {n_m} 根")
+        repo.upsert_fundamentals(s, symbol, fund)
+    ok = "已更新" if any(v is not None for v in fund.values()) else "無資料"
+    print(f"  日線 {n_px} 筆、新聞 {n_news} 則、月線 {n_m} 根、基本面 {ok}")
 
 
 def main() -> None:

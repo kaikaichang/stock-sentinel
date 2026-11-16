@@ -7,7 +7,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 from .indicators import compute_monthly_kd
-from .models import DailyPrice, MonthlyIndicator, StockNews, Watchlist
+from .models import DailyPrice, Fundamentals, MonthlyIndicator, StockNews, Watchlist
 
 
 def _nan_to_none(v):
@@ -142,3 +142,84 @@ def price_alerts(session: Session) -> list[tuple]:
         if w.target_high is not None and c >= w.target_high:
             out.append((w, d, c, "HIGH"))
     return out
+
+
+# ---- 以下為網頁 (app.py) 使用的唯讀查詢 ----
+
+def monthly_series(session: Session, symbol: str) -> pd.DataFrame:
+    """該標的的月 K 與月 KD，依月份由舊到新排序（繪圖需要時間遞增）。"""
+    q = (select(MonthlyIndicator.year_month, MonthlyIndicator.open,
+                MonthlyIndicator.high, MonthlyIndicator.low, MonthlyIndicator.close,
+                MonthlyIndicator.k_val, MonthlyIndicator.d_val,
+                MonthlyIndicator.prev_k, MonthlyIndicator.prev_d,
+                MonthlyIndicator.is_partial)
+         .where(MonthlyIndicator.symbol == symbol)
+         .order_by(MonthlyIndicator.year_month))
+    return pd.DataFrame(session.execute(q).all(), columns=[
+        "year_month", "open", "high", "low", "close",
+        "k_val", "d_val", "prev_k", "prev_d", "is_partial"])
+
+
+def latest_close(session: Session, symbol: str) -> tuple[date, float] | None:
+    """最新一筆有收盤價的 (交易日, 收盤價)；沒有資料回傳 None。"""
+    row = session.execute(
+        select(DailyPrice.trade_date, DailyPrice.close)
+        .where(DailyPrice.symbol == symbol, DailyPrice.close.is_not(None))
+        .order_by(DailyPrice.trade_date.desc()).limit(1)).first()
+    return (row[0], row[1]) if row else None
+
+
+def recent_news(session: Session, symbol: str, limit: int = 15) -> list[StockNews]:
+    """最新新聞。published_at 可能為 NULL，改以 fetched_at 當次要排序鍵，
+    避免沒有發布時間的新聞被排到最前面（SQLite 的 NULL 在 DESC 時排最後，此處明確處理）。"""
+    return list(session.scalars(
+        select(StockNews).where(StockNews.symbol == symbol)
+        .order_by(StockNews.published_at.is_(None), StockNews.published_at.desc(),
+                  StockNews.fetched_at.desc())
+        .limit(limit)))
+
+
+# ---- 基本面 ----
+
+FUNDAMENTAL_COLS = ("pe", "forward_pe", "pb", "roe", "dividend_yield",
+                    "free_cashflow", "debt_to_equity")
+
+
+def upsert_fundamentals(session: Session, symbol: str, data: dict) -> None:
+    """寫入基本面快照。
+
+    唯一鍵為 symbol：每檔只保留最新一份，重抓時 ON CONFLICT DO UPDATE 直接覆蓋，不會新增重複列。
+    抓到 None 也照樣覆蓋成 None（不保留舊值）：舊的 PE 若被留下，
+    使用者會把「已過期的便宜價」當成現況，寧可顯示「—」。
+    """
+    values = {c: data.get(c) for c in FUNDAMENTAL_COLS}
+    values["updated_at"] = datetime.now()
+    stmt = insert(Fundamentals).values(symbol=symbol, **values)
+    session.execute(stmt.on_conflict_do_update(index_elements=["symbol"], set_=values))
+
+
+def fundamentals_map(session: Session) -> dict[str, Fundamentals]:
+    """一次取回所有基本面，供篩選與網頁使用，避免逐檔查詢。"""
+    return {f.symbol: f for f in session.scalars(select(Fundamentals))}
+
+
+def filter_by_fundamentals(fmap: dict[str, Fundamentals], *, max_pe: float | None = None,
+                           max_pb: float | None = None, min_roe: float | None = None,
+                           min_yield: float | None = None) -> set[str] | None:
+    """回傳通過所有「已啟用條件」的代號集合；沒有任何條件時回傳 None（代表不過濾）。
+
+    roe / min_yield 以小數比較（0.15 = 15%）。條件間為 AND。
+    欄位為 None 且該條件啟用 → 視為不通過：沒資料不能當作便宜。
+    """
+    checks = []
+    if max_pe is not None:
+        checks.append(lambda f: f.pe is not None and f.pe < max_pe)
+    if max_pb is not None:
+        checks.append(lambda f: f.pb is not None and f.pb < max_pb)
+    if min_roe is not None:
+        checks.append(lambda f: f.roe is not None and f.roe > min_roe)
+    if min_yield is not None:
+        checks.append(lambda f: f.dividend_yield is not None and f.dividend_yield > min_yield)
+    if not checks:
+        return None
+    return {sym for sym, f in fmap.items() if all(c(f) for c in checks)}

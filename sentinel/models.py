@@ -75,3 +75,23 @@ class StockNews(Base):
     ai_analysis_json: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (UniqueConstraint("symbol", "link", name="uq_news_symbol_link"),)
+
+
+class Fundamentals(Base):
+    """價值投資基本面「最新快照」。
+
+    為什麼 symbol 單獨當主鍵：基本面是當下的一組數字而非時間序列，
+    每檔只留一列，重抓時直接覆蓋（Upsert），不會累積過期資料。
+    所有數值欄位皆可為 NULL：Yahoo 對虧損股（無 PE）、不配息股（無殖利率）、ETF 都會缺欄位。
+    """
+    __tablename__ = "fundamentals"
+
+    symbol: Mapped[str] = mapped_column(ForeignKey("watchlist.symbol"), primary_key=True)
+    pe: Mapped[float | None] = mapped_column(Float)              # trailingPE
+    forward_pe: Mapped[float | None] = mapped_column(Float)      # forwardPE
+    pb: Mapped[float | None] = mapped_column(Float)              # priceToBook
+    roe: Mapped[float | None] = mapped_column(Float)             # 小數：0.15 = 15%
+    dividend_yield: Mapped[float | None] = mapped_column(Float)  # 小數：0.04 = 4%
+    free_cashflow: Mapped[float | None] = mapped_column(Float)   # 原幣別絕對值
+    debt_to_equity: Mapped[float | None] = mapped_column(Float)  # Yahoo 原值為百分比：150 = 1.5 倍
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

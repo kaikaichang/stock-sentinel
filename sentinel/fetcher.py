@@ -1,4 +1,5 @@
 """yfinance 抓取層：日線與新聞。"""
+import math
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -48,3 +49,48 @@ def fetch_news(symbol: str) -> list[dict]:
             title=title, link=link, published_at=published, summary=c.get("summary"),
             publisher=(c.get("provider") or {}).get("displayName") or c.get("publisher")))
     return items
+
+
+def fetch_name(symbol: str) -> str | None:
+    """用 yfinance 的 shortName 自動補名稱；任何失敗都回傳 None，名稱留空即可，不影響主流程。"""
+    try:
+        info = yf.Ticker(symbol).info or {}
+        return info.get("shortName") or info.get("longName")
+    except Exception:
+        return None
+
+
+def _num(v) -> float | None:
+    """只接受有限的數字；None、NaN、Yahoo 偶爾回的 'Infinity' 字串一律轉 None。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if math.isfinite(v) else None
+
+
+def fetch_fundamentals(symbol: str) -> dict:
+    """抓價值投資基本面；任何欄位缺漏都容錯為 None，整體失敗則回傳全 None。"""
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:
+        info = {}
+
+    # 殖利率單位陷阱：Yahoo 的 dividendYield 單位不穩定（實測此版本為百分比：1.02 代表 1.02%，
+    # 舊版則是小數），直接用會差 100 倍，讓「殖利率 > 4%」整個失真。
+    # 因此自行計算：預估年股利 / 現價，單位固定為小數，數值也與 dividendYield 對得上。
+    # 不優先用 trailingAnnualDividendYield：它是「過去 12 個月實際配息」，
+    # 季配息或配息時點偏移的股票（如台積電）會被嚴重低估。它只當備援。
+    rate = _num(info.get("dividendRate"))
+    price = _num(info.get("currentPrice")) or _num(info.get("regularMarketPrice"))
+    dy = rate / price if rate is not None and price else None
+    if dy is None:
+        dy = _num(info.get("trailingAnnualDividendYield"))
+
+    return dict(
+        pe=_num(info.get("trailingPE")),
+        forward_pe=_num(info.get("forwardPE")),
+        pb=_num(info.get("priceToBook")),
+        roe=_num(info.get("returnOnEquity")),
+        dividend_yield=dy,
+        free_cashflow=_num(info.get("freeCashflow")),
+        debt_to_equity=_num(info.get("debtToEquity")),
+    )
