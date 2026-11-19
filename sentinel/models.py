@@ -23,10 +23,16 @@ class Watchlist(Base):
     target_high: Mapped[float | None] = mapped_column(Float)  # 高價警示
     notes: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # 'core'＝使用者手動關注的核心自選；'sp500'＝批次匯入的成分股掃描池。
+    # 'core'＝使用者手動關注的核心自選；'sp500'＝批次匯入的成分股掃描池；
+    # 'archived'＝移出核心且不屬於 S&P 500：保留歷史價量與研究報告，但不出現在任何日常清單
+    # （封存時同時 is_active=0，既有查詢本來就都過濾 is_active，所以不用逐一改）。
     # 分開存放是為了讓預設同步、警示價只作用在核心自選，不會被 500 檔拖慢或誤觸限流。
     category: Mapped[str] = mapped_column(String(10), default="core",
                                           server_default="core", index=True)
+    # 是否為（曾匯入過的）S&P 500 成分股。為什麼需要獨立欄位：
+    # 升級為 core 時 category 會被覆蓋，「原本來自 S&P 500」這項資訊就消失了，
+    # 但移出 core 時要靠它決定「降回掃描池」還是「封存」。由 import_universe 標記，之後不隨 category 變動。
+    in_sp500: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 研究報告佇列旗標：1＝需要（重新）分析、0＝已有最新報告。
     # 新加入或升級為 core 時設 1；add_report 成功後歸 0；使用者可在戰情室手動再設回 1。
     # 預設 1：新標的一定還沒有報告，天然就是「待分析」。

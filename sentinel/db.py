@@ -1,10 +1,14 @@
 """資料庫引擎與連線設定。"""
+import os
 from pathlib import Path
 
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
+# 環境變數 STOCK_SENTINEL_DB 可覆寫資料庫路徑，讓測試用暫存資料庫跑，絕不碰正式資料。
+# 必須在 import sentinel 之前設定（engine 在模組載入時就建立）；平常不設，行為不變。
+DB_PATH = (Path(os.environ["STOCK_SENTINEL_DB"]) if os.environ.get("STOCK_SENTINEL_DB")
+           else Path(__file__).resolve().parent.parent / "data" / "stocks.db")
 
 
 # 為什麼用 connect 事件，而不是只在啟動時執行一次 PRAGMA？
@@ -48,7 +52,7 @@ def init_db() -> None:
 
 
 def _ensure_columns() -> None:
-    """替既有資料庫補上後來新增的欄位（目前：watchlist.category、watchlist.needs_report）。
+    """替既有資料庫補上後來新增的欄位（目前：watchlist 的 category、needs_report、in_sp500）。
 
     為什麼需要：create_all 只會建立「不存在的資料表」，不會替已存在的表加欄位。
     既有的 stocks.db 是舊結構，若不補欄位，查詢新欄位會直接報 no such column。
@@ -73,3 +77,9 @@ def _ensure_columns() -> None:
             conn.execute(text(
                 "UPDATE watchlist SET needs_report = 0 "
                 "WHERE symbol IN (SELECT symbol FROM stock_reports)"))
+        if "in_sp500" not in cols:
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN in_sp500 INTEGER NOT NULL DEFAULT 0"))
+            # 掃描池裡的標的一定是成分股，先補上確定的；已升級成 core 的標的來源資訊早已被覆蓋，
+            # 重新執行 `python sync.py --import-sp500` 會依最新名單補齊（見 import_universe）。
+            conn.execute(text("UPDATE watchlist SET in_sp500 = 1 WHERE category = 'sp500'"))

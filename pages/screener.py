@@ -110,21 +110,52 @@ event = st.dataframe(
 picked = result.iloc[event.selection.rows]["symbol"].tolist() if event.selection.rows else []
 st.caption(f"已選取 {len(picked)} 檔" + (f"：{', '.join(picked)}" if picked else ""))
 
-b1, b2 = st.columns(2)
-add_clicked = b1.button("⭐ 加入核心觀察名單（設為 core）", width="stretch", disabled=not picked,
-                        help="可多選；已是核心的會略過，警示價與備註不會被改動")
-view_clicked = b2.button("📊 查看個股", width="stretch", disabled=len(picked) != 1,
+# 選取的標的依目前是否為核心分成兩組：加入只處理非核心的，移出只處理核心的，
+# 混選時各做各的、互不干擾；對應的那一組是空的，該按鈕就停用。
+picked_core = [sym for sym in picked if sym in core_set]
+picked_other = [sym for sym in picked if sym not in core_set]
+
+b1, b2, b3 = st.columns(3)
+add_clicked = b1.button("⭐ 加入核心觀察名單", width="stretch", disabled=not picked_other,
+                        help="可多選；只處理選取中「非核心」的標的，警示價與備註不會被改動"
+                        if picked_other else "請先勾選非核心（sp500）的標的")
+remove_clicked = b2.button("📤 移出核心觀察名單", width="stretch", disabled=not picked_core,
+                           help="可多選；只處理選取中的核心標的。S&P 500 成分股降回掃描池，其餘封存；"
+                                "價量與研究報告都會保留"
+                           if picked_core else "請先勾選核心（core）的標的")
+view_clicked = b3.button("📊 查看個股", width="stretch", disabled=len(picked) != 1,
                          help="請剛好選取 1 檔" if len(picked) != 1 else "跳到個股戰情室查看這一檔")
 
 if add_clicked:
     with SessionLocal.begin() as s:
-        n = repo.promote_to_core(s, picked)
+        n = repo.promote_to_core(s, picked_other)
     st.cache_data.clear()  # 名單與標記都快取過，不清掉就看不到變動
     st.session_state["screen_nonce"] = nonce + 1
     st.session_state["flash"] = (
-        ("success", f"已將 {n} 檔加入核心觀察名單（選取的其餘標的本來就是核心）。"
-                    "新聞與基本面可到戰情室按「單檔即時更新」補抓。")
+        ("success", f"已將 {n} 檔加入核心觀察名單。新聞與基本面可到戰情室按「單檔即時更新」補抓。")
         if n else ("info", "選取的標的都已經在核心觀察名單中。"))
+    st.rerun()
+
+if remove_clicked:
+    moved: dict[str, list[str]] = {"sp500": [], "archived": []}
+    with SessionLocal.begin() as s:
+        for sym in picked_core:
+            new_category = repo.demote_from_core(s, sym)
+            if new_category:
+                moved[new_category].append(sym)
+    st.cache_data.clear()
+    st.session_state["screen_nonce"] = nonce + 1
+    # 戰情室記著的選中代號若剛好被移出，要一併清掉，避免殘留指向已不在核心名單的標的
+    if st.session_state.get("selected_symbol") in picked_core:
+        st.session_state.pop("selected_symbol", None)
+    parts = []
+    if moved["sp500"]:
+        parts.append(f"降回 S&P 500 掃描池 {len(moved['sp500'])} 檔（{', '.join(moved['sp500'])}）")
+    if moved["archived"]:
+        parts.append(f"封存 {len(moved['archived'])} 檔（{', '.join(moved['archived'])}）")
+    st.session_state["flash"] = (
+        ("success", "已移出核心觀察名單：" + "；".join(parts) + "。研究報告與歷史資料保留。")
+        if parts else ("info", "選取的標的都已不在核心觀察名單中。"))
     st.rerun()
 
 if view_clicked and len(picked) == 1:

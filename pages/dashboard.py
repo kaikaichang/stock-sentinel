@@ -55,6 +55,12 @@ with st.sidebar:
     update_clicked = st.button(
         "🔄 單檔即時更新", width="stretch", disabled=not symbol,
         help="重新抓取目前顯示的這一檔" + ("（非核心標的只抓日線與月 KD）" if is_light else ""))
+    # 只有核心標的才有「移出」；🔍 臨時的非核心標的本來就不在名單內
+    demote_clicked = False
+    if symbol and symbol in core_watch:
+        demote_clicked = st.button(
+            "📤 移出核心觀察名單", key="demote_core", width="stretch",
+            help="S&P 500 成分股會降回掃描池；其餘封存。價量、研究報告與警示價都會保留。")
 
 ac.show_flash()
 job_box = st.container()  # 同步進度（st.status）顯示在這裡
@@ -65,6 +71,30 @@ if update_clicked and symbol:
         progress(1, 1)
         return ("success", f"已更新 {symbol}")
     ac.run_job(job_box, f"更新 {symbol}", _sync_current)
+
+if demote_clicked and symbol:
+    # 先算好「下一檔」再移出：取核心清單中的下一個，若是最後一個就取前一個，只剩它則為空。
+    # 這樣移出後畫面會接著顯示相鄰的標的，而不是跳回第一檔或指向一個已不在名單內的代號
+    # （selected_symbol 若殘留已移出的代號，下拉選單的 state 就不在選項內，會直接報錯）。
+    core_list = list(core_watch)
+    i = core_list.index(symbol)
+    next_symbol = (core_list[i + 1] if i + 1 < len(core_list)
+                   else (core_list[i - 1] if i > 0 else None))
+    with SessionLocal.begin() as s:
+        new_category = repo.demote_from_core(s, symbol)
+    st.cache_data.clear()  # 名單與標記都快取過，不清掉就還看得到剛移出的標的
+    if next_symbol:
+        st.session_state["selected_symbol"] = next_symbol
+    else:
+        st.session_state.pop("selected_symbol", None)
+    if new_category == "sp500":
+        st.session_state["flash"] = ("success", f"已移出 {symbol}：降回 S&P 500 掃描池（研究報告與歷史資料保留）。")
+    elif new_category == "archived":
+        st.session_state["flash"] = ("success", f"已移出 {symbol}：已封存，研究報告與歷史資料保留。"
+                                                "要加回請到「資料庫與同步中心」重新輸入代號。")
+    else:
+        st.session_state["flash"] = ("warning", f"{symbol} 已不在核心觀察名單，沒有變動。")
+    st.rerun()
 
 if not symbol:
     st.title("尚無資料")

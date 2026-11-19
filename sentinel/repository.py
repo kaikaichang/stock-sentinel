@@ -2,7 +2,7 @@
 from datetime import date, datetime
 
 import pandas as pd
-from sqlalchemy import case, exists, func, select, update
+from sqlalchemy import case, delete, exists, func, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
@@ -56,16 +56,21 @@ def import_universe(session: Session, items: list[tuple[str, str]],
     衝突時刻意「不碰 category、警示價、is_active」：若 NVDA 已在核心自選，
     匯入 S&P 500 不能把它降級成 sp500，否則它會從預設同步與警示檢查中消失。
     只在既有名稱為空時補上名稱。
+
+    唯一的例外是 in_sp500：匯入 sp500 名單時，無論標的目前是不是 core，都標記為成分股。
+    這是為了日後「移出核心」時能判斷該降回掃描池還是封存，也讓舊資料只要重新匯入一次名單就能補齊。
     """
     if not items:
         return 0, 0
     existing = set(session.scalars(select(Watchlist.symbol)))
+    is_sp500 = 1 if category == "sp500" else 0
     rows = [dict(symbol=sym, name=name, market="TW" if sym.endswith((".TW", ".TWO")) else "US",
-                 is_active=True, category=category) for sym, name in items]
+                 is_active=True, category=category, in_sp500=is_sp500) for sym, name in items]
     stmt = insert(Watchlist)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["symbol"],
-        set_={"name": func.coalesce(Watchlist.name, stmt.excluded.name)})
+    update_cols = {"name": func.coalesce(Watchlist.name, stmt.excluded.name)}
+    if is_sp500:
+        update_cols["in_sp500"] = 1
+    stmt = stmt.on_conflict_do_update(index_elements=["symbol"], set_=update_cols)
     session.execute(stmt, rows)
     added = sum(1 for sym, _ in items if sym not in existing)
     return added, len(items) - added
@@ -237,6 +242,49 @@ def promote_to_core(session: Session, symbols: list[str]) -> int:
                (Watchlist.category != "core") | (~Watchlist.is_active))
         .values(category="core", is_active=True, needs_report=1))
     return res.rowcount
+
+
+def demote_from_core(session: Session, symbol: str) -> str | None:
+    """把標的移出核心觀察名單，回傳新的 category；不存在或本來就不是 core 回傳 None。
+
+    - 屬於 S&P 500 成分股（in_sp500=1，含原本由 sp500 升級而來者）→ 降回 'sp500'，
+      仍是啟用狀態，回到掃描池。
+    - 其餘 → 'archived' 並 is_active=0。為什麼同時停用：專案內所有查詢（全部標的篩選、
+      警示價、預設同步、名單載入）本來就都過濾 is_active，封存標的因此「自動」不會
+      出現在日常清單，不必逐一修改那些查詢；category 仍保留「為什麼停用」的語意。
+    兩種情況都把 needs_report 設 0（移出後不再排入待分析），
+    且警示價、備註、價量、新聞、基本面與研究報告全部保留。
+    要加回核心：add_watch / promote_to_core 遇到 category != core 或已停用會重新啟用並排入待分析。
+    """
+    sym = symbol.strip().upper()
+    row = session.execute(
+        select(Watchlist.category, Watchlist.in_sp500).where(Watchlist.symbol == sym)).first()
+    if row is None or row.category != "core":
+        return None
+    if row.in_sp500:
+        new_category, active = "sp500", True
+    else:
+        new_category, active = "archived", False
+    session.execute(update(Watchlist).where(Watchlist.symbol == sym)
+                    .values(category=new_category, is_active=active, needs_report=0))
+    return new_category
+
+
+def delete_stock(session: Session, symbol: str) -> dict[str, int]:
+    """徹底刪除單檔標的與所有關聯資料（供誤加標的時清理），回傳各表刪除筆數。不可復原。
+
+    順序很重要：價量、新聞、基本面、報告的外鍵都指向 watchlist，
+    且連線開了 foreign_keys=ON，所以必須先刪子表、最後才刪 watchlist，否則會違反外鍵。
+    代號不存在時全部回傳 0，不報錯。
+    """
+    sym = symbol.strip().upper()
+    counts: dict[str, int] = {}
+    for table, model in (("stock_reports", StockReport), ("stock_news", StockNews),
+                         ("fundamentals", Fundamentals), ("monthly_indicators", MonthlyIndicator),
+                         ("daily_prices", DailyPrice)):
+        counts[table] = session.execute(delete(model).where(model.symbol == sym)).rowcount
+    counts["watchlist"] = session.execute(delete(Watchlist).where(Watchlist.symbol == sym)).rowcount
+    return counts
 
 
 # ---- 個股研究報告 ----
