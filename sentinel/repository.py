@@ -213,6 +213,17 @@ def recent_news(session: Session, symbol: str, limit: int = 15) -> list[StockNew
         .limit(limit)))
 
 
+def db_stats(session: Session) -> dict:
+    """資料庫概況：各標的池啟用中的標的數與全庫最新收盤日期（同步中心顯示用）。"""
+    rows = session.execute(
+        select(Watchlist.category, func.count()).where(Watchlist.is_active)
+        .group_by(Watchlist.category)).all()
+    counts = {cat: n for cat, n in rows}
+    return {"core": counts.get("core", 0), "sp500": counts.get("sp500", 0),
+            "total": sum(counts.values()),
+            "latest_date": session.scalar(select(func.max(DailyPrice.trade_date)))}
+
+
 # ---- 基本面 ----
 
 FUNDAMENTAL_COLS = ("pe", "forward_pe", "pb", "roe", "dividend_yield",

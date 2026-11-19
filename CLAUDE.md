@@ -24,8 +24,11 @@ stock-sentinel/
 ├─ .venv/            # 不進版控
 ├─ data/             # SQLite 檔案存放處，不進版控
 ├─ charts/           # chart.py 產生的互動 HTML，不進版控
-├─ sync.py / screen.py / chart.py
-└─ sentinel/         # db、models、repository、indicators、fetcher
+├─ sync.py / screen.py / chart.py   # 命令列工具
+├─ app.py            # 網頁入口路由器（st.navigation），streamlit run app.py
+├─ app_common.py     # 網頁三頁共用（快取查詢、圖表、同步進度、跨頁狀態）
+├─ pages/            # dashboard（個股戰情室）、screener（選股雷達）、sync_manager（同步中心）
+└─ sentinel/         # db、models、repository、indicators、fetcher、syncer（不依賴 streamlit）
 ```
 
 ## 常用指令（Windows PowerShell）

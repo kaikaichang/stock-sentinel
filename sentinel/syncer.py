@@ -73,6 +73,35 @@ def sync_core(log: Log = print, progress: Progress = _noop_progress) -> list[str
     return sync_symbols(symbols, log, progress)
 
 
+def add_and_sync(raw_symbol: str) -> str:
+    """新增一檔核心自選：抓日線、新聞、基本面、補名稱並寫庫，回傳標準化後的代號。
+    失敗時丟出例外且不寫入 watchlist。
+
+    為什麼「先抓、確認有資料，才寫入 watchlist」：
+    打錯代號時 yfinance 只會回傳空表，若先 add_watch 就會在清單裡留下一檔永遠沒資料的殭屍標的。
+    （原本寫在 app.py；它不含任何 UI，放在這裡網頁各頁與命令列都能共用。）
+    """
+    symbol = raw_symbol.strip().upper()
+    if not symbol:
+        raise ValueError("請輸入股票代號")
+    with SessionLocal() as s:
+        last = repo.latest_trade_date(s, symbol)  # 已存在則增量抓，與 sync.py 行為一致
+    df = fetcher.fetch_daily(symbol, last)
+    if df.empty and last is None:
+        raise ValueError(f"查無 {symbol} 的日線資料（台股請加後綴，例如 2330.TW）")
+    name = fetcher.fetch_name(symbol) if last is None else None
+    news = fetcher.fetch_news(symbol)
+    fund = fetcher.fetch_fundamentals(symbol)  # 內部已容錯：抓不到就是全 None，不影響日線寫入
+    with SessionLocal.begin() as s:
+        # 順序不可顛倒：daily_prices / news 的外鍵指向 watchlist，需先有母表資料（foreign_keys=ON）
+        repo.add_watch(s, symbol, name=name)
+        repo.upsert_daily(s, symbol, df)
+        repo.upsert_news(s, symbol, news)
+        repo.recompute_monthly(s, symbol)
+        repo.upsert_fundamentals(s, symbol, fund)
+    return symbol
+
+
 def import_sp500(log: Log = print) -> None:
     items = fetcher.fetch_sp500_list()
     with SessionLocal.begin() as s:
