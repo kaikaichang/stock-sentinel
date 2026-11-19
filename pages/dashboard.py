@@ -76,6 +76,7 @@ with SessionLocal() as s:
     news = repo.recent_news(s, symbol)
     fund = repo.fundamentals_map(s).get(symbol)
     report = repo.latest_report(s, symbol)
+    queued = repo.get_needs_report(s, symbol)  # 是否已排入待（重新）分析佇列
     # 在 session 內把需要的欄位取出，避免離開 with 後存取已脫離的物件
     news_rows = [(n.title, n.link, n.publisher, n.published_at, n.summary) for n in news]
     report_data = None if report is None else dict(
@@ -123,7 +124,19 @@ st.divider()
 left, right = st.columns(2)
 
 with left:
-    st.subheader("🧠 Claude 投資研究報告")
+    head, head_action = st.columns([3, 1], vertical_alignment="center")
+    head.subheader("🧠 Claude 投資研究報告")
+    # 只有核心觀察股才有「待分析」佇列，非核心的臨時標的不顯示（需先加入核心）。
+    # 已排入佇列（含新加入、尚無報告者）就只顯示狀態，避免重複點擊；
+    # 否則顯示按鈕，點擊後旗標設為 1，到同步中心的待分析清單就會看到它。
+    if symbol in core_watch:
+        if queued:
+            head_action.caption("⏳ 已排入待重算佇列")
+        elif head_action.button("🔄 標記重新分析", key="mark_redo", width="stretch",
+                                help="把這檔排入待分析清單，之後會產生新的研究報告"):
+            with SessionLocal.begin() as s:
+                repo.set_needs_report(s, symbol, True)
+            st.rerun()
     if report_data is None:
         st.info("這檔還沒有研究報告。報告建立後會顯示在這裡；"
                 "可到「資料庫與同步中心」查看待分析清單。")

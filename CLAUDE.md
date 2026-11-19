@@ -38,16 +38,27 @@ stock-sentinel/
 
 | 資料表 | 主鍵 / 唯一鍵 | 主要欄位 |
 |---|---|---|
-| `watchlist` | `symbol` | name、market(`US`/`TW`)、target_low / target_high（警示價）、notes、is_active、**category**（`core` 核心觀察名單／`sp500` 海選掃描池，預設 `core`）、created_at |
+| `watchlist` | `symbol` | name、market(`US`/`TW`)、target_low / target_high（警示價）、notes、is_active、**category**（`core` 核心觀察名單／`sp500` 海選掃描池，預設 `core`）、**needs_report**（INTEGER，預設 1：1＝需要（重新）分析、0＝已有最新報告）、created_at |
 | `daily_prices` | (`symbol`, `trade_date`) | open、high、low、close、adj_close、volume；以 Upsert 寫入，同日重抓只覆蓋 |
 | `monthly_indicators` | (`symbol`, `year_month` 'YYYY-MM') | open、high、low、close、k_val、d_val、prev_k、prev_d、is_partial（當月未收盤）；索引 (year_month, k_val, d_val) |
 | `stock_news` | `id`；唯一 (`symbol`, `link`) | title、publisher、link、published_at、summary、fetched_at、ai_analysis_json（預留） |
 | `fundamentals` | `symbol` | pe、forward_pe、pb、roe、dividend_yield（小數）、free_cashflow、debt_to_equity、updated_at；每檔只留最新快照 |
 | `stock_reports` | `id`（自增） | symbol（FK）、verdict（結論標籤）、business_model、moat_and_valuation、catalysts、risks_and_triggers、created_at（TEXT）；一檔可有多份，畫面取 id 最大者 |
 
-- `category` 對既有資料庫由 `sentinel/db.py` 的 `_ensure_columns()` 以 `ALTER TABLE` 安全補上（冪等）；新資料表由 `create_all` 自動建立。
-- 標的升級為核心：`repository.promote_to_core()`（只改 category / is_active，不動警示價與備註）。
-- 待分析清單：`repository.core_without_report()`（啟用中、尚無任何 `stock_reports` 的 core 標的）。
+- `category`、`needs_report` 對既有資料庫由 `sentinel/db.py` 的 `_ensure_columns()` 以 `ALTER TABLE` 安全補上（冪等）；新資料表由 `create_all` 自動建立。
+  新增 `needs_report` 的那一次，已有報告的標的會被校正為 0（避免被誤判成待重算）。
+- 標的升級為核心：`repository.promote_to_core()`（只改 category / is_active / needs_report，不動警示價與備註）。
+- 待分析清單：`repository.pending_reports()`——啟用中的 core，且 `needs_report = 1` 或 `stock_reports` 中沒有任何紀錄。
+
+**研究報告佇列狀態流轉**（`needs_report`）：
+
+```
+新加入 core / 由 sp500 升級為 core ──▶ needs_report = 1（待分析）
+待分析 ──repository.add_report 成功──▶ needs_report = 0（同一交易內歸零）
+已有報告 ──戰情室「🔄 標記重新分析」（set_needs_report）──▶ needs_report = 1（待重算）
+```
+
+已是 core 的標的重複新增或重複「加入核心」不會重新排入佇列。
 
 ## 注意事項
 

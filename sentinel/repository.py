@@ -2,7 +2,7 @@
 from datetime import date, datetime
 
 import pandas as pd
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import case, exists, func, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,12 @@ def add_watch(session: Session, symbol: str, name=None, market=None,
     # 使用者手動新增＝明確表示要關注，所以連 S&P 500 池裡的標的也升級為 core
     # （反過來，批次匯入絕不會把 core 降級，見 import_universe）。
     update["category"] = "core"
+    # 研究報告佇列：只有「原本不是 core（或已停用）」、這次才變成 core 的標的才重新排入；
+    # 已是 core 的重複新增不能把 needs_report 洗回 1，否則已完成的報告會被無故排回待分析。
+    # SQL 的 SET 子句右側讀到的是更新前的列，所以這裡的判斷用的是「舊的 category / is_active」。
+    update["needs_report"] = case(
+        ((Watchlist.category != "core") | (~Watchlist.is_active), 1),
+        else_=Watchlist.needs_report)
     session.execute(stmt.on_conflict_do_update(index_elements=["symbol"], set_=update))
 
 
@@ -217,7 +223,9 @@ def recent_news(session: Session, symbol: str, limit: int = 15) -> list[StockNew
 def promote_to_core(session: Session, symbols: list[str]) -> int:
     """把指定標的升級為核心觀察名單，回傳「實際有變動」的檔數（本來就是 core 的不算）。
 
-    只改 category / is_active，絕不動警示價與備註：使用者可能已經替這檔設好警示價。
+    只改 category / is_active / needs_report，絕不動警示價與備註：使用者可能已經替這檔設好警示價。
+    實際「變成 core」的標的同時 needs_report=1（排入待分析）；本來就是 core 的不動，
+    所以重複按「加入核心」不會把已完成的報告又排回佇列（WHERE 已經把它們排除在外）。
     不存在的代號直接略過（UPDATE 比對不到列），不會報錯。
     """
     syms = [s.strip().upper() for s in symbols if s and s.strip()]
@@ -227,7 +235,7 @@ def promote_to_core(session: Session, symbols: list[str]) -> int:
         update(Watchlist)
         .where(Watchlist.symbol.in_(syms),
                (Watchlist.category != "core") | (~Watchlist.is_active))
-        .values(category="core", is_active=True))
+        .values(category="core", is_active=True, needs_report=1))
     return res.rowcount
 
 
@@ -236,13 +244,32 @@ def promote_to_core(session: Session, symbols: list[str]) -> int:
 def add_report(session: Session, symbol: str, verdict: str, business_model: str | None = None,
                moat_and_valuation: str | None = None, catalysts: str | None = None,
                risks_and_triggers: str | None = None) -> int:
-    """新增一份研究報告並回傳 id。同一檔可累積多份，不覆蓋舊報告。"""
-    report = StockReport(symbol=symbol.upper(), verdict=verdict, business_model=business_model,
+    """新增一份研究報告並回傳 id。同一檔可累積多份，不覆蓋舊報告。
+
+    寫入成功後在「同一個交易」內把該標的 needs_report 歸 0：報告與旗標要嘛一起成功、
+    要嘛一起回滾，不會出現「報告寫了但還卡在待分析」或「旗標清了卻沒有報告」的不一致。
+    """
+    symbol = symbol.upper()
+    report = StockReport(symbol=symbol, verdict=verdict, business_model=business_model,
                          moat_and_valuation=moat_and_valuation, catalysts=catalysts,
                          risks_and_triggers=risks_and_triggers)
     session.add(report)
     session.flush()  # 取得自增 id
+    session.execute(update(Watchlist).where(Watchlist.symbol == symbol).values(needs_report=0))
     return report.id
+
+
+def set_needs_report(session: Session, symbol: str, needs_report: bool) -> bool:
+    """手動設定「需要（重新）分析」旗標；代號不存在回傳 False。"""
+    res = session.execute(update(Watchlist).where(Watchlist.symbol == symbol.upper())
+                          .values(needs_report=1 if needs_report else 0))
+    return res.rowcount > 0
+
+
+def get_needs_report(session: Session, symbol: str) -> bool:
+    """該標的目前是否已排入待（重新）分析；代號不存在回傳 False。"""
+    v = session.scalar(select(Watchlist.needs_report).where(Watchlist.symbol == symbol.upper()))
+    return bool(v)
 
 
 def latest_report(session: Session, symbol: str) -> StockReport | None:
@@ -252,13 +279,19 @@ def latest_report(session: Session, symbol: str) -> StockReport | None:
         .order_by(StockReport.id.desc()).limit(1))
 
 
-def core_without_report(session: Session) -> list[tuple[str, str]]:
-    """啟用中的 core 標的裡，還沒有任何研究報告的 [(代號, 名稱)]，依代號排序（待分析清單）。"""
-    q = (select(Watchlist.symbol, Watchlist.name)
+def pending_reports(session: Session) -> list[tuple[str, str, bool]]:
+    """待分析清單：[(代號, 名稱, 是否已有報告)]，依代號排序。
+
+    條件：啟用中的 core，且 (needs_report = 1 或 stock_reports 中沒有任何紀錄)。
+    「沒有任何紀錄」這一條是保險：就算旗標被誤清成 0，從沒產生過報告的標的也不會被漏掉。
+    第三個欄位讓介面分辨「尚無報告」（False）與「待重新分析」（True）。
+    """
+    has_report = exists().where(StockReport.symbol == Watchlist.symbol)
+    q = (select(Watchlist.symbol, Watchlist.name, has_report)
          .where(Watchlist.is_active, Watchlist.category == "core",
-                ~exists().where(StockReport.symbol == Watchlist.symbol))
+                (Watchlist.needs_report == 1) | ~has_report)
          .order_by(Watchlist.symbol))
-    return [(sym, name or "") for sym, name in session.execute(q)]
+    return [(sym, name or "", bool(has)) for sym, name, has in session.execute(q)]
 
 
 def db_stats(session: Session) -> dict:

@@ -48,12 +48,12 @@ def init_db() -> None:
 
 
 def _ensure_columns() -> None:
-    """替既有資料庫補上後來新增的欄位（目前：watchlist.category）。
+    """替既有資料庫補上後來新增的欄位（目前：watchlist.category、watchlist.needs_report）。
 
     為什麼需要：create_all 只會建立「不存在的資料表」，不會替已存在的表加欄位。
-    既有的 stocks.db 是舊結構，若不補欄位，查詢 category 會直接報 no such column。
-    ADD COLUMN 帶 DEFAULT 'core'：SQLite 要求 NOT NULL 的新欄位必須有預設值，
-    同時讓既有的核心自選股自動歸為 core，不用另外搬資料。
+    既有的 stocks.db 是舊結構，若不補欄位，查詢新欄位會直接報 no such column。
+    ADD COLUMN 帶 DEFAULT：SQLite 要求 NOT NULL 的新欄位必須有預設值，
+    同時讓既有資料自動有合理的初始值，不用另外搬資料。
     冪等：先用 PRAGMA table_info 檢查，已有欄位就略過，重複啟動是安全的。
     """
     with engine.begin() as conn:
@@ -63,3 +63,13 @@ def _ensure_columns() -> None:
                 "ALTER TABLE watchlist ADD COLUMN category VARCHAR(10) NOT NULL DEFAULT 'core'"))
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_watchlist_category ON watchlist (category)"))
+        if "needs_report" not in cols:
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN needs_report INTEGER NOT NULL DEFAULT 1"))
+            # 為什麼要立刻校正：ADD COLUMN 的預設值 1 會套到「所有既有列」，
+            # 包含早就有研究報告的標的，它們會被誤判成待重算。
+            # 只在「剛新增欄位」這一次執行，已有欄位的資料庫不會被洗掉使用者標記的狀態。
+            # （init_db 先 create_all 再呼叫本函式，所以 stock_reports 此時一定存在。）
+            conn.execute(text(
+                "UPDATE watchlist SET needs_report = 0 "
+                "WHERE symbol IN (SELECT symbol FROM stock_reports)"))

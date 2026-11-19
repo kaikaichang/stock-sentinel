@@ -27,6 +27,10 @@ class Watchlist(Base):
     # 分開存放是為了讓預設同步、警示價只作用在核心自選，不會被 500 檔拖慢或誤觸限流。
     category: Mapped[str] = mapped_column(String(10), default="core",
                                           server_default="core", index=True)
+    # 研究報告佇列旗標：1＝需要（重新）分析、0＝已有最新報告。
+    # 新加入或升級為 core 時設 1；add_report 成功後歸 0；使用者可在戰情室手動再設回 1。
+    # 預設 1：新標的一定還沒有報告，天然就是「待分析」。
+    needs_report: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

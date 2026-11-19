@@ -12,10 +12,10 @@ job_box = st.container()  # 同步進度（st.status）顯示在這裡
 # 概況不快取：資料量極小，而且同步完成後一定要立刻看到新數字
 with SessionLocal() as s:
     stats = repo.db_stats(s)
-    pending = repo.core_without_report(s)
+    pending = repo.pending_reports(s)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("核心觀察股", stats["core"])
-m2.metric("待分析（無研究報告）", len(pending))
+m2.metric("待分析／待重算", len(pending))
 m3.metric("最新收盤日期", str(stats["latest_date"]) if stats["latest_date"] else "—")
 m4.metric("S&P 500 掃描池", stats["sp500"])
 if stats["sp500"] == 0:
@@ -25,10 +25,11 @@ st.subheader("📋 待分析清單")
 if not stats["core"]:
     st.caption("核心觀察名單是空的，請先新增股票。")
 elif not pending:
-    st.success("全部核心觀察股都已有研究報告。")
+    st.success("沒有待處理的研究報告：全部核心觀察股都已有最新報告。")
 else:
-    st.caption("以下核心觀察股尚未建立 Claude 研究報告：")
-    st.dataframe([{"代號": sym, "名稱": name} for sym, name in pending],
+    st.caption("以下核心觀察股尚未建立 Claude 研究報告，或已被標記為需要重新分析：")
+    st.dataframe([{"代號": sym, "名稱": name, "狀態": "待重新分析" if has_report else "尚無報告"}
+                  for sym, name, has_report in pending],
                  hide_index=True, width="stretch", height=min(35 * len(pending) + 38, 320))
 
 st.divider()
