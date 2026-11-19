@@ -1,6 +1,6 @@
-"""📊 個股戰情室：選一檔股票，看卡片、月 K 與月 KD 圖、基本面與新聞。
+"""📊 個股戰情室：選一檔核心觀察股，看卡片、月 K 與月 KD 圖、基本面、Claude 研究報告與新聞。
 
-可由其他頁面透過 st.session_state["selected_symbol"] 帶入代號（例如選股雷達點選一列）。
+可由其他頁面透過 st.session_state["selected_symbol"] 帶入代號（例如選股雷達的「查看個股」）。
 """
 import pandas as pd
 import streamlit as st
@@ -9,60 +9,59 @@ import app_common as ac
 from sentinel import repository as repo, syncer
 from sentinel.db import SessionLocal
 
-# 其他頁面（選股雷達、同步中心）改寫 selected_symbol 後切過來時，標的池可能不對：
-# 與本頁上次寫入的值不同，就代表是「外部帶入」，此時把標的池切到該代號所屬的池。
-# 不能每次都強制跟隨，否則使用者自己切換標的池時會被立刻彈回去。
+core_watch = ac.load_watchlist("core")
+gc_set, alert_set = ac.load_markers("core")
+
+# 從雷達帶來的標的可能不是核心（例如 S&P 500 池）。下拉選單平常只列核心，
+# 這種標的就「臨時」放在最上方並標示 🔍，讓使用者仍能看圖；一旦改選別檔，它就不再出現。
 incoming = st.session_state.get("selected_symbol")
-if incoming and incoming != st.session_state.get("_dash_synced"):
-    target_pool = ac.pool_for(incoming)
-    if target_pool:
-        st.session_state["pool"] = target_pool
+temp_symbol = None
+temp_name = ""
+if incoming and incoming not in core_watch:
+    all_watch = ac.load_watchlist(None)
+    if incoming in all_watch:
+        temp_symbol, temp_name = incoming, all_watch[incoming]
+
+options = ([temp_symbol] if temp_symbol else []) + list(core_watch)
+
+
+def label(sym: str) -> str:
+    if sym == temp_symbol:
+        return f"🔍非核心 {sym} {temp_name}".strip()
+    marks = ("🟢" if sym in gc_set else "") + ("🔔" if sym in alert_set else "")
+    return f"{marks + ' ' if marks else ''}{sym} {core_watch.get(sym, '')}".strip()
+
 
 with st.sidebar:
     st.header("📊 個股戰情室")
-    save_pool = ac.sticky("pool", "dash_pool_w", ac.DEFAULT_POOL)
-    pool_label = st.radio("標的池", list(ac.POOLS), key="dash_pool_w", horizontal=True,
-                          on_change=save_pool)
-    category = ac.POOLS[pool_label]
-    is_scan = category == "sp500"
-
-    watch = ac.load_watchlist(category)
-    gc_set, alert_set = ac.load_markers(category)
-    options = list(watch)
-
-    def label(sym: str) -> str:
-        marks = ("🟢" if sym in gc_set else "") + ("🔔" if sym in alert_set else "")
-        return f"{marks + ' ' if marks else ''}{sym} {watch.get(sym, '')}".strip()
-
     symbol = None
     if options:
-        # 以 selected_symbol 為準灌回 widget；它不在這個池的名單內時退回第一檔
-        current = st.session_state.get("selected_symbol")
-        st.session_state["dash_symbol_w"] = current if current in options else options[0]
+        # 以 selected_symbol 為準灌回 widget（見 app_common.sticky 的說明）；不在名單內時退回第一檔
+        st.session_state["dash_symbol_w"] = incoming if incoming in options else options[0]
         symbol = st.selectbox(
-            "選擇股票", options, key="dash_symbol_w", format_func=label,
+            "核心觀察名單", options, key="dash_symbol_w", format_func=label,
             on_change=lambda: st.session_state.__setitem__(
                 "selected_symbol", st.session_state["dash_symbol_w"]))
         st.caption("🟢 月KD<20 黃金交叉　🔔 觸及警示價")
         st.session_state["selected_symbol"] = symbol
-        st.session_state["_dash_synced"] = symbol
-    elif is_scan:
-        st.info("掃描池是空的，請先執行 `python sync.py --import-sp500`。")
     else:
-        st.info("資料庫還沒有標的，請到「資料庫與同步中心」新增。")
+        st.info("核心觀察名單是空的。請到「資料庫與同步中心」新增股票，"
+                "或在「選股雷達」把標的加入核心。")
 
     st.divider()
     st.caption("資料更新")
+    # 非核心標的只更新日線與月 KD（不抓新聞與基本面），與批次同步的範圍一致
+    is_light = bool(symbol) and symbol not in core_watch
     update_clicked = st.button(
-        "🔄 更新當前標的", width="stretch", disabled=not symbol,
-        help="重新抓取目前顯示的這一檔" + ("（掃描池只抓日線與月 KD）" if is_scan else ""))
+        "🔄 單檔即時更新", width="stretch", disabled=not symbol,
+        help="重新抓取目前顯示的這一檔" + ("（非核心標的只抓日線與月 KD）" if is_light else ""))
 
 ac.show_flash()
 job_box = st.container()  # 同步進度（st.status）顯示在這裡
 
 if update_clicked and symbol:
     def _sync_current(log, progress):
-        syncer.sync_one(symbol, log, light=is_scan)
+        syncer.sync_one(symbol, log, light=is_light)
         progress(1, 1)
         return ("success", f"已更新 {symbol}")
     ac.run_job(job_box, f"更新 {symbol}", _sync_current)
@@ -76,11 +75,20 @@ with SessionLocal() as s:
     last_px = repo.latest_close(s, symbol)
     news = repo.recent_news(s, symbol)
     fund = repo.fundamentals_map(s).get(symbol)
+    report = repo.latest_report(s, symbol)
     # 在 session 內把需要的欄位取出，避免離開 with 後存取已脫離的物件
     news_rows = [(n.title, n.link, n.publisher, n.published_at, n.summary) for n in news]
+    report_data = None if report is None else dict(
+        verdict=report.verdict, business_model=report.business_model,
+        moat_and_valuation=report.moat_and_valuation, catalysts=report.catalysts,
+        risks_and_triggers=report.risks_and_triggers, created_at=report.created_at)
 
-st.title(f"{symbol}　{watch.get(symbol, '')}")
+name = core_watch.get(symbol) or (temp_name if symbol == temp_symbol else "")
+st.title(f"{symbol}　{name}")
+if symbol == temp_symbol:
+    st.caption("🔍 這檔不在核心觀察名單。可到「選股雷達」勾選後按「⭐ 加入核心觀察名單」。")
 
+# ───────────────────────── 上半：數據卡片與圖表 ─────────────────────────
 if monthly.empty or last_px is None:
     st.warning("這檔還沒有價格資料，請先用 `python sync.py --symbol "
                f"{symbol}` 同步（S&P 500 池可用 `python sync.py --batch-sp500`）。")
@@ -109,13 +117,38 @@ if fund is None:
 else:
     st.caption(f"基本面更新於 {fund.updated_at:%Y-%m-%d %H:%M}")
 
-st.subheader("📰 最新新聞")
-if not news_rows:
-    st.caption("資料庫中沒有這檔的新聞。")
-for title, link, publisher, published, summary in news_rows:
-    st.markdown(f"**[{title}]({link})**")
-    st.caption(f"{publisher or '未知來源'} · {published:%Y-%m-%d %H:%M}" if published
-               else (publisher or "未知來源"))
-    if summary:
-        st.write(summary)
-    st.divider()
+st.divider()
+
+# ───────────────────────── 下半：研究報告（左）與新聞（右）─────────────────────────
+left, right = st.columns(2)
+
+with left:
+    st.subheader("🧠 Claude 投資研究報告")
+    if report_data is None:
+        st.info("這檔還沒有研究報告。報告建立後會顯示在這裡；"
+                "可到「資料庫與同步中心」查看待分析清單。")
+    else:
+        # 報告內容由 Claude 產生，屬於「資料」：一律用 st.markdown 顯示純文字格式，
+        # 不開 unsafe_allow_html，避免內容夾帶 HTML 被執行。
+        with st.container(border=True):
+            st.markdown(f"#### {report_data['verdict']}")
+            st.caption(f"報告時間：{report_data['created_at']}")
+        sections = [("🏢 公司與產業在做什麼", report_data["business_model"]),
+                    ("🏰 護城河與當前估值", report_data["moat_and_valuation"]),
+                    ("🚀 未來 6~12 個月催化劑", report_data["catalysts"]),
+                    ("⚠️ 核心風險與觀察指標", report_data["risks_and_triggers"])]
+        for title, body in sections:
+            st.markdown(f"**{title}**")
+            st.markdown(body or "—")
+
+with right:
+    st.subheader("📰 近期相關新聞")
+    if not news_rows:
+        st.caption("資料庫中沒有這檔的新聞。")
+    for title, link, publisher, published, summary in news_rows:
+        st.markdown(f"**[{title}]({link})**")
+        st.caption(f"{publisher or '未知來源'} · {published:%Y-%m-%d %H:%M}" if published
+                   else (publisher or "未知來源"))
+        if summary:
+            st.write(summary)
+        st.divider()

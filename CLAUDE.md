@@ -13,7 +13,7 @@
 4. **先設計再實作**：每次建立新功能前，先提出簡短的架構與資料表說明，經確認後再動手寫程式。
 5. **版本控制**：`.gitignore` 必須排除 `.env`、`.venv/`、`__pycache__/`，以及 `data/` 下所有 SQLite 檔案（`*.db`、`*.db-wal`、`*.db-shm`）。
 
-## 專案結構（規劃中）
+## 專案結構
 
 ```
 stock-sentinel/
@@ -30,6 +30,29 @@ stock-sentinel/
 ├─ pages/            # dashboard（個股戰情室）、screener（選股雷達）、sync_manager（同步中心）
 └─ sentinel/         # db、models、repository、indicators、fetcher、syncer（不依賴 streamlit）
 ```
+
+網頁三頁：📊 個股戰情室（預設首頁，只列核心觀察名單）、🎯 價值與月 KD 選股雷達、⚙️ 資料庫與同步中心。
+頁面間用 `st.session_state["selected_symbol"]` 傳遞代號（例如雷達選一檔後按「查看個股」）。
+
+## 資料庫 Schema（data/stocks.db，SQLite + WAL）
+
+| 資料表 | 主鍵 / 唯一鍵 | 主要欄位 |
+|---|---|---|
+| `watchlist` | `symbol` | name、market(`US`/`TW`)、target_low / target_high（警示價）、notes、is_active、**category**（`core` 核心觀察名單／`sp500` 海選掃描池，預設 `core`）、created_at |
+| `daily_prices` | (`symbol`, `trade_date`) | open、high、low、close、adj_close、volume；以 Upsert 寫入，同日重抓只覆蓋 |
+| `monthly_indicators` | (`symbol`, `year_month` 'YYYY-MM') | open、high、low、close、k_val、d_val、prev_k、prev_d、is_partial（當月未收盤）；索引 (year_month, k_val, d_val) |
+| `stock_news` | `id`；唯一 (`symbol`, `link`) | title、publisher、link、published_at、summary、fetched_at、ai_analysis_json（預留） |
+| `fundamentals` | `symbol` | pe、forward_pe、pb、roe、dividend_yield（小數）、free_cashflow、debt_to_equity、updated_at；每檔只留最新快照 |
+| `stock_reports` | `id`（自增） | symbol（FK）、verdict（結論標籤）、business_model、moat_and_valuation、catalysts、risks_and_triggers、created_at（TEXT）；一檔可有多份，畫面取 id 最大者 |
+
+- `category` 對既有資料庫由 `sentinel/db.py` 的 `_ensure_columns()` 以 `ALTER TABLE` 安全補上（冪等）；新資料表由 `create_all` 自動建立。
+- 標的升級為核心：`repository.promote_to_core()`（只改 category / is_active，不動警示價與備註）。
+- 待分析清單：`repository.core_without_report()`（啟用中、尚無任何 `stock_reports` 的 core 標的）。
+
+## 注意事項
+
+- 修改 `sentinel/` 底下的模組後，要**重啟** `streamlit run app.py`：Streamlit 會熱重載 `app.py` 與 `pages/`，但已載入的套件模組可能還是舊版。
+- 建議用 `streamlit run app.py --server.address localhost` 啟動，避免個人資料對區網開放。
 
 ## 常用指令（Windows PowerShell）
 

@@ -99,3 +99,27 @@ class Fundamentals(Base):
     free_cashflow: Mapped[float | None] = mapped_column(Float)   # 原幣別絕對值
     debt_to_equity: Mapped[float | None] = mapped_column(Float)  # Yahoo 原值為百分比：150 = 1.5 倍
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+def _now_text() -> str:
+    """報告建立時間：固定格式的 ISO 文字（'YYYY-MM-DD HH:MM:SS'），字串排序即時間排序。"""
+    return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+
+class StockReport(Base):
+    """Claude 個股研究報告。
+
+    為什麼一檔可以有多份：每次重新分析都新增一列而不是覆蓋，保留「當時怎麼看」的歷史；
+    畫面只取最新一份（以 id 最大者為準，自增 id 比比較時間字串更不會出錯）。
+    內容欄位是 Claude 產生的文字，屬於「資料」，顯示時只能當 Markdown 文字，不可當 HTML。
+    """
+    __tablename__ = "stock_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(ForeignKey("watchlist.symbol"), index=True)
+    verdict: Mapped[str] = mapped_column(Text)                          # 投資結論標籤，如「🟢 適合分批布局」
+    business_model: Mapped[str | None] = mapped_column(Text)           # 公司與產業在做什麼
+    moat_and_valuation: Mapped[str | None] = mapped_column(Text)       # 護城河與當前估值評價
+    catalysts: Mapped[str | None] = mapped_column(Text)                # 未來 6~12 個月催化劑
+    risks_and_triggers: Mapped[str | None] = mapped_column(Text)       # 核心風險與觀察指標
+    created_at: Mapped[str] = mapped_column(Text, default=_now_text)

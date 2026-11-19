@@ -18,8 +18,8 @@ from sentinel.models import Watchlist
 UP_COLOR, DOWN_COLOR = "#e53935", "#2e9e5b"
 K_COLOR, D_COLOR = "#f59e0b", "#3b82f6"
 
-POOLS = {"核心自選": "core", "S&P 500 掃描池": "sp500"}
-DEFAULT_POOL = "核心自選"
+# 選股雷達的候選池：None ＝ 不限分類（核心＋掃描池）
+SCREEN_POOLS = {"全部標的": None, "Core 名單": "core"}
 SIGNALS = {"低檔黃金交叉": "golden_cross", "低檔勾頭向上": "hook_up", "高檔死亡交叉（>80）": "death_cross"}
 CACHE_TTL = 300  # 秒。終端機另外跑 sync.py 時，網頁最多 5 分鐘後也會反映；網頁按鈕完成後會手動清除
 
@@ -39,28 +39,21 @@ def load_markers(category: str) -> tuple[set[str], set[str]]:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_watchlist(category: str) -> dict[str, str]:
-    """{代號: 名稱}，只含啟用中且屬於該標的池的標的。"""
+def load_watchlist(category: str | None) -> dict[str, str]:
+    """{代號: 名稱}，只含啟用中且屬於該標的池的標的；category=None 代表全部。"""
+    q = select(Watchlist.symbol, Watchlist.name).where(Watchlist.is_active)
+    if category is not None:
+        q = q.where(Watchlist.category == category)
     with SessionLocal() as s:
-        rows = s.execute(select(Watchlist.symbol, Watchlist.name)
-                         .where(Watchlist.is_active, Watchlist.category == category)
-                         .order_by(Watchlist.symbol)).all()
+        rows = s.execute(q.order_by(Watchlist.symbol)).all()
     return {sym: (name or "") for sym, name in rows}
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def run_screener(signal_type: str, lookback: int, threshold: float,
-                 still_bullish: bool, category: str) -> pd.DataFrame:
+                 still_bullish: bool, category: str | None) -> pd.DataFrame:
     with SessionLocal() as s:
         return repo.screen_monthly_kd(s, signal_type, lookback, threshold, still_bullish, category)
-
-
-def pool_for(symbol: str) -> str | None:
-    """代號屬於哪個標的池（回傳 POOLS 的顯示名稱）；不在任何池回傳 None。"""
-    for label, cat in POOLS.items():
-        if symbol in load_watchlist(cat):
-            return label
-    return None
 
 
 # ───────────────────────── 跨頁狀態 ─────────────────────────
@@ -89,7 +82,8 @@ def show_flash() -> None:
     """
     flash = st.session_state.pop("flash", None)
     if flash:
-        {"success": st.success, "warning": st.warning, "error": st.error}[flash[0]](flash[1])
+        {"success": st.success, "info": st.info,
+         "warning": st.warning, "error": st.error}[flash[0]](flash[1])
 
 
 def run_job(box, title: str, job) -> None:

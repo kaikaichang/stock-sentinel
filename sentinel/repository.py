@@ -2,12 +2,13 @@
 from datetime import date, datetime
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 from .indicators import compute_monthly_kd
-from .models import DailyPrice, Fundamentals, MonthlyIndicator, StockNews, Watchlist
+from .models import (DailyPrice, Fundamentals, MonthlyIndicator, StockNews, StockReport,
+                     Watchlist)
 
 
 def _nan_to_none(v):
@@ -211,6 +212,53 @@ def recent_news(session: Session, symbol: str, limit: int = 15) -> list[StockNew
         .order_by(StockNews.published_at.is_(None), StockNews.published_at.desc(),
                   StockNews.fetched_at.desc())
         .limit(limit)))
+
+
+def promote_to_core(session: Session, symbols: list[str]) -> int:
+    """把指定標的升級為核心觀察名單，回傳「實際有變動」的檔數（本來就是 core 的不算）。
+
+    只改 category / is_active，絕不動警示價與備註：使用者可能已經替這檔設好警示價。
+    不存在的代號直接略過（UPDATE 比對不到列），不會報錯。
+    """
+    syms = [s.strip().upper() for s in symbols if s and s.strip()]
+    if not syms:
+        return 0
+    res = session.execute(
+        update(Watchlist)
+        .where(Watchlist.symbol.in_(syms),
+               (Watchlist.category != "core") | (~Watchlist.is_active))
+        .values(category="core", is_active=True))
+    return res.rowcount
+
+
+# ---- 個股研究報告 ----
+
+def add_report(session: Session, symbol: str, verdict: str, business_model: str | None = None,
+               moat_and_valuation: str | None = None, catalysts: str | None = None,
+               risks_and_triggers: str | None = None) -> int:
+    """新增一份研究報告並回傳 id。同一檔可累積多份，不覆蓋舊報告。"""
+    report = StockReport(symbol=symbol.upper(), verdict=verdict, business_model=business_model,
+                         moat_and_valuation=moat_and_valuation, catalysts=catalysts,
+                         risks_and_triggers=risks_and_triggers)
+    session.add(report)
+    session.flush()  # 取得自增 id
+    return report.id
+
+
+def latest_report(session: Session, symbol: str) -> StockReport | None:
+    """該標的最新一份報告（id 最大者）；沒有報告回傳 None。"""
+    return session.scalar(
+        select(StockReport).where(StockReport.symbol == symbol)
+        .order_by(StockReport.id.desc()).limit(1))
+
+
+def core_without_report(session: Session) -> list[tuple[str, str]]:
+    """啟用中的 core 標的裡，還沒有任何研究報告的 [(代號, 名稱)]，依代號排序（待分析清單）。"""
+    q = (select(Watchlist.symbol, Watchlist.name)
+         .where(Watchlist.is_active, Watchlist.category == "core",
+                ~exists().where(StockReport.symbol == Watchlist.symbol))
+         .order_by(Watchlist.symbol))
+    return [(sym, name or "") for sym, name in session.execute(q)]
 
 
 def db_stats(session: Session) -> dict:

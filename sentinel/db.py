@@ -36,7 +36,11 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 
 def init_db() -> None:
-    """建立所有資料表（已存在則略過）。"""
+    """建立所有資料表（已存在則略過）。
+
+    新增的資料表（例如 stock_reports）由 create_all 直接建立，既有資料庫不需要手動遷移；
+    只有「既有資料表新增欄位」才需要 _ensure_columns。
+    """
     from .models import Base
 
     Base.metadata.create_all(engine)

@@ -12,16 +12,27 @@ job_box = st.container()  # 同步進度（st.status）顯示在這裡
 # 概況不快取：資料量極小，而且同步完成後一定要立刻看到新數字
 with SessionLocal() as s:
     stats = repo.db_stats(s)
+    pending = repo.core_without_report(s)
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("自選股總數", stats["total"])
-m2.metric("核心自選", stats["core"])
-m3.metric("S&P 500 池", stats["sp500"])
-m4.metric("最新收盤日期", str(stats["latest_date"]) if stats["latest_date"] else "—")
+m1.metric("核心觀察股", stats["core"])
+m2.metric("待分析（無研究報告）", len(pending))
+m3.metric("最新收盤日期", str(stats["latest_date"]) if stats["latest_date"] else "—")
+m4.metric("S&P 500 掃描池", stats["sp500"])
 if stats["sp500"] == 0:
     st.caption("S&P 500 池是空的，可先執行 `python sync.py --import-sp500` 匯入成分股名單。")
 
+st.subheader("📋 待分析清單")
+if not stats["core"]:
+    st.caption("核心觀察名單是空的，請先新增股票。")
+elif not pending:
+    st.success("全部核心觀察股都已有研究報告。")
+else:
+    st.caption("以下核心觀察股尚未建立 Claude 研究報告：")
+    st.dataframe([{"代號": sym, "名稱": name} for sym, name in pending],
+                 hide_index=True, width="stretch", height=min(35 * len(pending) + 38, 320))
+
 st.divider()
-st.subheader("新增股票")
+st.subheader("新增股票（加入核心觀察名單）")
 with st.form("add_form", border=False):
     new_sym = st.text_input("股票代號", placeholder="AAPL 或 2330.TW")
     submitted = st.form_submit_button("抓取並寫入", type="primary")
@@ -33,9 +44,8 @@ if submitted:
         st.error(f"新增失敗：{e}")
     else:
         st.cache_data.clear()  # 名單與標記都快取過，不清掉就看不到新標的
-        # 預先指定戰情室要看的標的：新增的一律是核心自選，所以標的池也一併切回核心
+        # 預先指定戰情室要看的標的（新增的一律是核心觀察股，一定在戰情室的下拉選單內）
         st.session_state["selected_symbol"] = added
-        st.session_state["pool"] = ac.DEFAULT_POOL
         st.session_state["flash"] = ("success", f"已新增 {added}，可到「個股戰情室」查看。")
         st.rerun()
 
@@ -65,9 +75,9 @@ def _recompute(log, progress):
 
 
 b1, b2, b3 = st.columns(3)
-if b1.button("🚀 同步全部自選股", width="stretch",
-             help="逐檔抓日線、新聞與基本面，每檔間隔 1 秒"):
-    ac.run_job(job_box, "同步全部自選股", _sync_core)
+if b1.button("🚀 同步全部觀察股", width="stretch",
+             help="核心觀察股逐檔抓日線、新聞與基本面，每檔間隔 1 秒"):
+    ac.run_job(job_box, "同步全部觀察股", _sync_core)
 if b2.button("🌐 同步 S&P 500 池（批次）", width="stretch",
              help="分批抓日線與月 KD，不抓新聞，約需 1 分鐘"):
     ac.run_job(job_box, "同步 S&P 500 池", _sync_sp500)
